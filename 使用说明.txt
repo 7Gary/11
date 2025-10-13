@@ -1,0 +1,37 @@
+# train:
+    # 环境变量
+    export PYTHONPATH=src
+
+    # MVTec 数据集路径
+    datapath=/data/c425/cx/Patchcore_net/datasets/mvtec_anomaly_detection/mvtec_anomaly_detection/
+    datasets=('bottle'  'cable'  'capsule'  'carpet'  'grid'  'hazelnut' 'leather'  'metal_nut'  'pill' 'screw' 'tile' 'toothbrush' 'transistor' 'wood' 'zipper' 'bupi' 'user3')
+    dataset_flags=($(for dataset in "${datasets[@]}"; do echo '-d '"${dataset}"; done))
+
+
+python bin/run_patchcore_user.py \
+  --gpu 0 \
+  --seed 22 \
+  --save_patchcore_model \
+  --log_group IM320_WR50_L2-3_P020_D768_PS-3_AN-5_Q092_H256 \
+  --log_project MVTecAD_Results results \
+  patch_core \
+  -b wideresnet50 \
+  -le layer2 \
+  -le layer3 \
+  --faiss_on_gpu \
+  --pretrain_embed_dimension 1024 \
+  --target_embed_dimension 768 \
+  --anomaly_scorer_num_nn 5 \
+  --patchsize 3 \
+  --clean_patch_quantile 0.92 \
+  --clean_patch_min_ratio 0.05 \
+  sampler \
+  -p 0.2 \
+  approx_greedy_coreset \
+  dataset \
+  -d user3 \
+  --resize 256 \
+  --imagesize 256 \
+  custom $datapath
+
+
