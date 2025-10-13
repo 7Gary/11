@@ -1,4 +1,5 @@
 import os
+from bisect import bisect_right
 from enum import Enum
 
 import PIL
@@ -30,10 +31,12 @@ class CustomDataset(torch.utils.data.Dataset):
             self,
             source,
             classname,
-            resize=256,
-            imagesize=224,
+            resize=None,
+            imagesize=None,
             split=DatasetSplit.TRAIN,
             train_val_split=1.0,
+            tile_size=512,
+            tile_overlap=0,
             **kwargs,
     ):
         """
@@ -42,12 +45,16 @@ class CustomDataset(torch.utils.data.Dataset):
             classname: [str or None]. Name of class that should be
                        provided in this dataset. If None, the datasets
                        iterates over all available classes.
-            resize: [int]. (Square) Size the loaded image initially gets
-                    resized to.
-            imagesize: [int]. (Square) Size the resized loaded image gets
-                       (center-)cropped to.
+            resize: [int or None]. Optional (square) size to which the loaded
+                    image tile is resized before further processing.
+            imagesize: [int or None]. Optional (square) size the resized loaded
+                       image tile gets (center-)cropped to.
             split: [enum-option]. Indicates if training or test split of the
                    data should be used.
+            tile_size: [int]. Size of the (square) tiles extracted from the
+                        original image.
+            tile_overlap: [int]. Overlap between neighbouring tiles measured
+                           in pixels. Defaults to 0 (no overlap).
         """
         super().__init__()
         self.source = source
@@ -55,46 +62,71 @@ class CustomDataset(torch.utils.data.Dataset):
         self.classnames_to_use = [classname] if classname is not None else _CUSTOM_CLASSNAMES
         self.train_val_split = train_val_split
 
+        self.tile_size = tile_size
+        self.tile_overlap = tile_overlap
+
         self.imgpaths_per_class, self.data_to_iterate = self.get_image_data()
 
-        self.transform_img = [
-            transforms.Resize(resize),
-            transforms.CenterCrop(imagesize),
+        self.transform_img = []
+        self.transform_mask_ops = []
+
+        if resize is not None:
+            self.transform_img.append(transforms.Resize(resize))
+            self.transform_mask_ops.append(
+                transforms.Resize(resize, interpolation=PIL.Image.NEAREST)
+            )
+        if imagesize is not None:
+            self.transform_img.append(transforms.CenterCrop(imagesize))
+            self.transform_mask_ops.append(transforms.CenterCrop(imagesize))
+
+        self.transform_img.extend([
             transforms.ToTensor(),
             transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-        ]
-        self.transform_img = transforms.Compose(self.transform_img)
+        ])
+        self.transform_mask_ops.append(transforms.ToTensor())
 
-        self.imagesize = (3, imagesize, imagesize)
+        self.transform_img = transforms.Compose(self.transform_img)
+        self.transform_mask = transforms.Compose(self.transform_mask_ops)
+
+        if imagesize is not None:
+            self.imagesize = (3, imagesize, imagesize)
+        elif resize is not None:
+            self.imagesize = (3, resize, resize)
+        else:
+            self.imagesize = (3, self.tile_size, self.tile_size)
+
+        self.tile_bboxes_cache = {}
+        self.tiles_per_image = []
+        self.cumulative_tiles = []
+        self.total_tiles = 0
+
+        self._prepare_tiles_metadata()
 
     def __getitem__(self, idx):
-        # 计算原始图像索引和切片索引
-        orig_idx = idx // 2
-        slice_idx = idx % 2  # 0=左切片, 1=右切片
+        if idx < 0 or idx >= self.total_tiles:
+            raise IndexError("Index out of range for dataset tiles.")
 
-        classname, anomaly, image_path, mask_path = self.data_to_iterate[orig_idx]
-        full_image = PIL.Image.open(image_path).convert("RGB")
+        image_idx = bisect_right(self.cumulative_tiles, idx)
+        prev_cumulative = self.cumulative_tiles[image_idx - 1] if image_idx > 0 else 0
+        tile_idx = idx - prev_cumulative
 
-        # 定义两个切片的边界框
-        if slice_idx == 0:  # 左切片
-            bbox = (0, 0, 1024, 1024)
-        else:  # 右切片
-            bbox = (1024, 0, 2048, 1024)
+        classname, anomaly, image_path, mask_path = self.data_to_iterate[image_idx]
 
-        # 裁剪图像
-        tile = full_image.crop(bbox)
+        bboxes = self.tile_bboxes_cache[image_path]
+        bbox = bboxes[tile_idx]
+
+        with PIL.Image.open(image_path) as pil_image:
+            tile = pil_image.crop(bbox).convert("RGB")
         image = self.transform_img(tile)
 
-        # 处理掩码
         if self.split == DatasetSplit.TEST and mask_path is not None:
-            full_mask = PIL.Image.open(mask_path)
-            mask = full_mask.crop(bbox)
+            with PIL.Image.open(mask_path) as pil_mask:
+                mask = pil_mask.crop(bbox)
             mask = self.transform_mask(mask)
         else:
             mask = torch.zeros([1, *image.size()[1:]])
 
-        # 添加切片标识到图像名称
-        slice_suffix = "_left" if slice_idx == 0 else "_right"
+        slice_suffix = f"_tile_{tile_idx}_x{bbox[0]}_y{bbox[1]}"
         image_name = "/".join(image_path.split("/")[-4:]) + slice_suffix
 
         return {
@@ -118,7 +150,7 @@ class CustomDataset(torch.utils.data.Dataset):
         # }
 
     def __len__(self):
-        return len(self.data_to_iterate) * 2
+        return self.total_tiles
 
     def get_image_data(self):
         imgpaths_per_class = {}
@@ -174,3 +206,60 @@ class CustomDataset(torch.utils.data.Dataset):
                     data_to_iterate.append([classname, anomaly, image_path, None])
 
         return imgpaths_per_class, data_to_iterate
+
+    def _prepare_tiles_metadata(self):
+        total = 0
+        cumulative = []
+
+        for data in self.data_to_iterate:
+            image_path = data[2]
+            try:
+                with PIL.Image.open(image_path) as image:
+                    width, height = image.size
+            except FileNotFoundError:
+                width, height = self.tile_size, self.tile_size
+
+            bboxes = self._compute_tile_bboxes(width, height)
+            self.tile_bboxes_cache[image_path] = bboxes
+
+            tile_count = len(bboxes)
+            self.tiles_per_image.append(tile_count)
+            total += tile_count
+            cumulative.append(total)
+
+        self.total_tiles = total
+        self.cumulative_tiles = cumulative
+
+    def _compute_tile_bboxes(self, width, height):
+        if width <= 0 or height <= 0:
+            return [(0, 0, 0, 0)]
+
+        step = max(1, self.tile_size - self.tile_overlap)
+
+        x_starts = self._compute_axis_starts(width, step)
+        y_starts = self._compute_axis_starts(height, step)
+
+        bboxes = []
+        for y in y_starts:
+            for x in x_starts:
+                right = min(x + self.tile_size, width)
+                lower = min(y + self.tile_size, height)
+                left = max(0, right - self.tile_size)
+                upper = max(0, lower - self.tile_size)
+                bboxes.append((left, upper, right, lower))
+
+        return bboxes
+
+    def _compute_axis_starts(self, length, step):
+        starts = []
+        pos = 0
+        while pos + self.tile_size <= length:
+            starts.append(pos)
+            pos += step
+
+        if not starts:
+            starts.append(0)
+        elif starts[-1] + self.tile_size < length:
+            starts.append(max(0, length - self.tile_size))
+
+        return sorted(set(starts))
