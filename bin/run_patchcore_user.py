@@ -184,42 +184,6 @@ def run(
                 x[1] != "good" for x in dataloaders["testing"].dataset.data_to_iterate
             ]
 
-            tiles_per_image = getattr(
-                dataloaders["testing"].dataset, "tiles_per_image", None
-            )
-            aggregated_by_tiles = False
-            if tiles_per_image and sum(tiles_per_image) == len(scores):
-                aggregated_scores = []
-                aggregated_image_paths = []
-                aggregated_image_names = []
-                start_idx = 0
-
-                for tile_count in tiles_per_image:
-                    end_idx = start_idx + tile_count
-                    tile_scores = scores[start_idx:end_idx]
-                    aggregated_scores.append(np.max(tile_scores))
-
-                    if image_paths.size:
-                        aggregated_image_paths.append(image_paths[start_idx])
-                    if image_names.size:
-                        aggregated_image_names.append(image_names[start_idx])
-
-                    start_idx = end_idx
-
-                scores = np.array(aggregated_scores)
-                image_paths = (
-                    np.array(aggregated_image_paths, dtype=object)
-                    if aggregated_image_paths
-                    else np.array([], dtype=object)
-                )
-                image_names = (
-                    np.array(aggregated_image_names, dtype=object)
-                    if aggregated_image_names
-                    else np.array([], dtype=object)
-                )
-                aggregated_by_tiles = True
-
-
             # (Optional) Plot example images.
             if save_segmentation_images:
                 image_paths = [
@@ -257,31 +221,21 @@ def run(
                     image_transform=image_transform,
                     mask_transform=mask_transform,
                 )
-            if aggregated_by_tiles:
-                if image_paths.size:
-                    base_image_paths = image_paths.tolist()
-                else:
-                    base_image_paths = [None] * len(scores)
-                if image_names.size:
-                    base_image_names = image_names.tolist()
-                else:
-                    base_image_names = [None] * len(scores)
+            reshaped_scores = scores.reshape(-1, 2)
+
+            # 使用最大值或平均值聚合
+            scores = np.max(reshaped_scores, axis=1)  # 或 np.mean
+
+            if image_paths.size:
+                image_paths = image_paths.reshape(-1, 2)
+                base_image_paths = [pair[0] for pair in image_paths.tolist()]
             else:
-                reshaped_scores = scores.reshape(-1, 2)
-
-                # 使用最大值或平均值聚合
-                scores = np.max(reshaped_scores, axis=1)  # 或 np.mean
-
-                if image_paths.size:
-                    image_paths = image_paths.reshape(-1, 2)
-                    base_image_paths = [pair[0] for pair in image_paths.tolist()]
-                else:
-                    base_image_paths = [None] * len(scores)
-                if image_names.size:
-                    image_names = image_names.reshape(-1, 2)
-                    base_image_names = [pair[0] for pair in image_names.tolist()]
-                else:
-                    base_image_names = [None] * len(scores)
+                base_image_paths = [None] * len(scores)
+            if image_names.size:
+                image_names = image_names.reshape(-1, 2)
+                base_image_names = [pair[0] for pair in image_names.tolist()]
+            else:
+                base_image_names = [None] * len(scores)
 
             LOGGER.info("Computing evaluation metrics.")
             imagewise_metrics = patchcore.metrics.compute_imagewise_retrieval_metrics(
@@ -337,13 +291,13 @@ def run(
                 else:
                     predicted_records.append(f"index_{idx}")
 
-            if predicted_records:
-                LOGGER.info(
-                    "预测为异常的样本路径列表: %s",
-                    " | ".join(predicted_records),
-                )
-            else:
-                LOGGER.info("预测为异常的样本路径列表: 无")
+            # if predicted_records:
+            #     LOGGER.info(
+            #         "预测为异常的样本路径列表: %s",
+            #         " | ".join(predicted_records),
+            #     )
+            # else:
+            #     LOGGER.info("预测为异常的样本路径列表: 无")
 
             contamination_ratio = 0.0
             recovered_patches = 0
@@ -351,11 +305,11 @@ def run(
                 outlier_stats = getattr(PatchCore_list[0], "training_outlier_stats", {})
                 contamination_ratio = outlier_stats.get("pseudo_ratio", 0.0) * 100
                 recovered_patches = outlier_stats.get("recovered_patches", 0)
-            LOGGER.info(
-                "诊断: 当前训练集污染率约为 %.2f%%, 伪异常清洗后回收补丁数为 %d, 这是影响漏检率/过杀率的关键因素。",
-                contamination_ratio,
-                recovered_patches,
-            )
+            # LOGGER.info(
+            #     "诊断: 当前训练集污染率约为 %.2f%%, 伪异常清洗后回收补丁数为 %d, 这是影响漏检率/过杀率的关键因素。",
+            #     contamination_ratio,
+            #     recovered_patches,
+            # )
 
             # Compute PRO score & PW Auroc for all images
             # pixel_scores = patchcore.metrics.compute_pixelwise_retrieval_metrics(
