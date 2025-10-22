@@ -8,6 +8,8 @@ import torch
 import torch.nn.functional as F
 import tqdm
 
+import patchcore.contamination as contamination
+
 import patchcore
 import patchcore.backbones
 import patchcore.common
@@ -21,6 +23,11 @@ class PatchCore(torch.nn.Module):
         """PatchCore anomaly detection class."""
         super(PatchCore, self).__init__()
         self.device = device
+        self.contamination_controller = None
+        self.closed_loop_controller = None
+        self.dual_memory = contamination.ReciprocalDualMemoryDistillation()
+        self.dashboard = contamination.ContaminationDashboard()
+        self._current_gamma = 0.0
 
     def load(
         self,
@@ -86,6 +93,26 @@ class PatchCore(torch.nn.Module):
         self.clean_patch_quantile = kwargs.pop("clean_patch_quantile", 0.9)
         self.clean_patch_min_ratio = kwargs.pop("clean_patch_min_ratio", 0.05)
 
+        self.enable_contamination_elasticity = kwargs.pop(
+            "enable_contamination_elasticity", True
+        )
+        self.elasticity_smoothing = kwargs.pop("elasticity_smoothing", 0.2)
+        self.elasticity_temperature = kwargs.pop("elasticity_temperature", 2.0)
+        self.elasticity_min_threshold = kwargs.pop("elasticity_min_threshold", 1.0)
+        self.dual_memory_temperature = kwargs.pop(
+            "dual_memory_temperature", self.pseudo_negative_temperature
+        )
+        self.enable_closed_loop = kwargs.pop("enable_closed_loop", True)
+        self.closed_loop_alpha = kwargs.pop("closed_loop_alpha", 1.2)
+        self.closed_loop_beta = kwargs.pop("closed_loop_beta", 0.5)
+        self.closed_loop_eta = kwargs.pop("closed_loop_eta", 0.1)
+        self.closed_loop_base_temperature = kwargs.pop(
+            "closed_loop_base_temperature", self.pseudo_negative_temperature
+        )
+        self.closed_loop_max_temperature = kwargs.pop("closed_loop_max_temperature", 0.5)
+        if self.closed_loop_max_temperature < self.closed_loop_base_temperature:
+            self.closed_loop_max_temperature = self.closed_loop_base_temperature
+
         self.pseudo_anomaly_scorer = None
         self._pseudo_memory_active = False
         if self.use_pseudo_negatives:
@@ -104,6 +131,29 @@ class PatchCore(torch.nn.Module):
         )
 
         self.featuresampler = featuresampler
+        self.dual_memory = contamination.ReciprocalDualMemoryDistillation(
+            temperature=self.dual_memory_temperature
+        )
+        self.dashboard = contamination.ContaminationDashboard()
+        self._current_gamma = 0.0
+        self.contamination_controller = None
+        self.closed_loop_controller = None
+        if self.enable_contamination_elasticity:
+            self.contamination_controller = contamination.ContaminationElasticityController(
+                feature_dim=self.target_embed_dimension,
+                smoothing=self.elasticity_smoothing,
+                elasticity_temperature=self.elasticity_temperature,
+                minimum_threshold=self.elasticity_min_threshold,
+            )
+            if self.enable_closed_loop:
+                self.closed_loop_controller = contamination.ClosedLoopContaminationControl(
+                    self.contamination_controller,
+                    alpha=self.closed_loop_alpha,
+                    beta=self.closed_loop_beta,
+                    eta=self.closed_loop_eta,
+                    base_temperature=self.closed_loop_base_temperature,
+                    max_temperature=self.closed_loop_max_temperature,
+                )
 
     def embed(self, data):
         if isinstance(data, torch.utils.data.DataLoader):
@@ -228,13 +278,29 @@ class PatchCore(torch.nn.Module):
                         else:
                             metadata[key] = values
                     metadata_per_image.append(metadata)
+        elasticity_state = None
+        if (
+            self.contamination_controller is not None
+            and len(image_level_embeddings) > 0
+        ):
+            stacked_embeddings = np.asarray(image_level_embeddings)
+            elasticity_state = self.contamination_controller.estimate(
+                stacked_embeddings
+            )
+            self._current_gamma = elasticity_state.gamma
+            self.dashboard.log_elasticity(elasticity_state)
+        else:
+            self._current_gamma = 0.0
 
         (
             normal_features,
             pseudo_anomaly_features,
             outlier_stats,
         ) = self._separate_normal_and_pseudo_anomalies(
-            features_per_image, image_level_embeddings, metadata_per_image
+            features_per_image,
+            image_level_embeddings,
+            metadata_per_image,
+            elasticity_state=elasticity_state,
         )
 
         features = self.featuresampler.run(normal_features)
@@ -254,6 +320,40 @@ class PatchCore(torch.nn.Module):
             self._pseudo_memory_active = True
 
         self.training_outlier_stats = outlier_stats
+        if elasticity_state is not None:
+            if self.closed_loop_controller is not None:
+                loop_state = self.closed_loop_controller.step(
+                    elasticity_state.contamination_rate
+                )
+                self.normal_memory_weight = loop_state.normal_weight
+                self.pseudo_negative_weight = loop_state.pseudo_weight
+                self.pseudo_negative_temperature = loop_state.temperature
+                self.dual_memory.temperature = loop_state.temperature
+                self.dashboard.log_closed_loop(loop_state)
+                outlier_stats.update(
+                    {
+                        "closed_loop_gain": float(loop_state.control_gain),
+                        "closed_loop_integral": float(loop_state.integral_term),
+                        "controlled_normal_weight": float(
+                            self.normal_memory_weight
+                        ),
+                        "controlled_pseudo_weight": float(
+                            self.pseudo_negative_weight
+                        ),
+                        "controlled_temperature": float(self.dual_memory.temperature),
+                    }
+                )
+            outlier_stats.update(
+                {
+                    "elasticity": float(elasticity_state.elasticity),
+                    "gamma": float(elasticity_state.gamma),
+                    "contamination_rate": float(
+                        elasticity_state.contamination_rate
+                    ),
+                }
+            )
+
+        outlier_stats["dashboard"] = self.dashboard.export()
         if outlier_stats.get("pseudo_ratio", 0) > 0:
             LOGGER.info(
                 "Training set contamination estimate: %.2f%% pseudo anomalies detected.",
@@ -335,32 +435,41 @@ class PatchCore(torch.nn.Module):
         return [score for score in image_scores], [mask for mask in masks]
 
     def _compute_dual_memory_scores(self, features):
-        normal_patch_scores, _, _ = self.anomaly_scorer.predict([features])
-        combined_patch_scores = normal_patch_scores
+        (
+            normal_patch_scores,
+            normal_distances,
+            _,
+        ) = self.anomaly_scorer.predict([features])
+
+        pseudo_distances = None
 
         if self._pseudo_memory_active and self.pseudo_anomaly_scorer is not None:
             _, pseudo_distances, _ = self.pseudo_anomaly_scorer.predict([features])
-            pseudo_component = np.exp(
-                -np.maximum(pseudo_distances.mean(axis=-1), 0)
-                / max(self.pseudo_negative_temperature, 1e-12)
-            )
-            combined_patch_scores = (
-                self.normal_memory_weight * normal_patch_scores
-                + self.pseudo_negative_weight * pseudo_component
-            )
+        combined_patch_scores = self.dual_memory.combine(
+            normal_patch_scores,
+            normal_distances,
+            pseudo_distances,
+            gamma=self._current_gamma,
+            normal_weight=self.normal_memory_weight,
+            pseudo_weight=self.pseudo_negative_weight,
+        )
+        self.dashboard.log_dual_memory(self.dual_memory.energy_trace)
 
         return combined_patch_scores, combined_patch_scores
 
     def _separate_normal_and_pseudo_anomalies(
-        self, features_per_image, image_level_embeddings, metadata_per_image
+            self,
+            features_per_image,
+            image_level_embeddings,
+            metadata_per_image,
+            elasticity_state=None,
     ):
         """Split training features into normal/pseudo-anomalous banks.
 
-        Following the pseudo-outlier filtering strategies proposed in
-        CVPR'22 POF and the dual-memory modelling ideas exemplified by
-        AAAI'22 MemSeg, we treat high Mahalanobis-distance samples as
-        pseudo negatives and store them separately from the normal memory
-        bank.
+        This routine integrates the proposed contamination elasticity principle
+        by default. When ``elasticity_state`` is provided, the robust Mahalanobis
+        distances and elastic threshold are used to identify pseudo anomalies;
+        otherwise, the classical Mahalanobis heuristic is used as a fallback.
         """
         if not features_per_image:
             raise RuntimeError("No features were computed for memory bank training.")
@@ -383,16 +492,23 @@ class PatchCore(torch.nn.Module):
             return normal_features, pseudo_anomaly_features, outlier_stats
 
         image_embeddings = np.asarray(image_level_embeddings)
-        mean_embedding = np.mean(image_embeddings, axis=0)
-        centered_embeddings = image_embeddings - mean_embedding
-        covariance = np.cov(centered_embeddings, rowvar=False)
-        covariance += np.eye(covariance.shape[0]) * self.pseudo_negative_eps
-        inv_covariance = np.linalg.pinv(covariance)
-        mahalanobis = np.sqrt(
-            np.sum(centered_embeddings @ inv_covariance * centered_embeddings, axis=1)
-        )
+        if elasticity_state is not None:
+            robust_distances = np.asarray(elasticity_state.distances)
+        else:
+            mean_embedding = np.mean(image_embeddings, axis=0)
+            centered_embeddings = image_embeddings - mean_embedding
+            covariance = np.cov(centered_embeddings, rowvar=False)
+            covariance += np.eye(covariance.shape[0]) * self.pseudo_negative_eps
+            inv_covariance = np.linalg.pinv(covariance)
+            robust_distances = np.sqrt(
+                np.sum(centered_embeddings @ inv_covariance * centered_embeddings, axis=1)
+            )
 
-        num_candidates = len(mahalanobis)
+        num_candidates = len(robust_distances)
+        if num_candidates == 0:
+            return normal_features, pseudo_anomaly_features, outlier_stats
+
+
         desired_pseudo = int(num_candidates * self.pseudo_negative_ratio)
         desired_pseudo = max(desired_pseudo, self.pseudo_negative_min_count)
         if self.pseudo_negative_max_count is not None:
@@ -402,8 +518,19 @@ class PatchCore(torch.nn.Module):
         if desired_pseudo <= 0:
             return normal_features, pseudo_anomaly_features, outlier_stats
 
-        sorted_indices = np.argsort(mahalanobis)[::-1]
-        pseudo_indices = sorted_indices[:desired_pseudo]
+        sorted_indices = np.argsort(robust_distances)[::-1]
+        if elasticity_state is not None:
+            pseudo_mask = np.asarray(elasticity_state.pseudo_mask)
+            pseudo_indices = np.where(pseudo_mask)[0]
+            if desired_pseudo > 0 and len(pseudo_indices) < desired_pseudo:
+                existing = set(pseudo_indices.tolist())
+                padding = [
+                    idx for idx in sorted_indices if idx not in existing
+                ][: desired_pseudo - len(pseudo_indices)]
+                if padding:
+                    pseudo_indices = np.concatenate([pseudo_indices, padding])
+        else:
+            pseudo_indices = sorted_indices[:desired_pseudo]
         outlier_stats["initial_pseudo_count"] = len(pseudo_indices)
 
         if len(pseudo_indices) == 0:
@@ -448,7 +575,16 @@ class PatchCore(torch.nn.Module):
                 "pseudo_ratio": len(filtered_metadata) / float(num_candidates)
                 if num_candidates > 0
                 else 0.0,
-                "threshold": float(mahalanobis[pseudo_indices[-1]]),
+                "threshold": float(
+                    elasticity_state.threshold
+                    if elasticity_state is not None
+                    else robust_distances[pseudo_indices[-1]]
+                ),
+                "distance_mean": float(np.mean(robust_distances)),
+                "distance_std": float(np.std(robust_distances)),
+                "robust_distance_topk": robust_distances[
+                    sorted_indices[: min(20, len(sorted_indices))]
+                ].tolist(),
             }
         )
 
@@ -608,6 +744,17 @@ class PatchCore(torch.nn.Module):
             "normal_memory_weight": self.normal_memory_weight,
             "clean_patch_quantile": self.clean_patch_quantile,
             "clean_patch_min_ratio": self.clean_patch_min_ratio,
+            "enable_contamination_elasticity": self.enable_contamination_elasticity,
+            "elasticity_smoothing": self.elasticity_smoothing,
+            "elasticity_temperature": self.elasticity_temperature,
+            "elasticity_min_threshold": self.elasticity_min_threshold,
+            "dual_memory_temperature": self.dual_memory.temperature,
+            "enable_closed_loop": self.enable_closed_loop,
+            "closed_loop_alpha": self.closed_loop_alpha,
+            "closed_loop_beta": self.closed_loop_beta,
+            "closed_loop_eta": self.closed_loop_eta,
+            "closed_loop_base_temperature": self.closed_loop_base_temperature,
+            "closed_loop_max_temperature": self.closed_loop_max_temperature,
         }
         with open(self._params_file(save_path, prepend), "wb") as save_file:
             pickle.dump(patchcore_params, save_file, pickle.HIGHEST_PROTOCOL)
