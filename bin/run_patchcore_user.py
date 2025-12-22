@@ -1,10 +1,14 @@
 import contextlib
+import inspect
 import logging
 import os
 import sys
 import click
 import numpy as np
+import pandas as pd
 import torch
+import json
+
 
 import patchcore.backbones
 import patchcore.common
@@ -21,7 +25,6 @@ _DATASETS = {"mvtec": ["patchcore.datasets.mvtec", "MVTecDataset"],
              }
 
 
-
 @click.group(chain=True)
 @click.argument("results_path", type=str)
 @click.option("--gpu", type=int, default=[0], multiple=True, show_default=True)
@@ -29,6 +32,8 @@ _DATASETS = {"mvtec": ["patchcore.datasets.mvtec", "MVTecDataset"],
 @click.option("--log_group", type=str, default="group")
 @click.option("--log_project", type=str, default="project")
 @click.option("--save_segmentation_images", is_flag=True)
+@click.option("--save_faf_visualizations", is_flag=True)
+@click.option("--save_dica_visualizations", is_flag=True)
 @click.option("--save_patchcore_model", is_flag=True)
 def main(**kwargs):
     pass
@@ -43,6 +48,8 @@ def run(
     log_group,
     log_project,
     save_segmentation_images,
+    save_faf_visualizations,
+    save_dica_visualizations,
     save_patchcore_model,
 ):
     methods = {key: item for (key, item) in methods}
@@ -64,6 +71,7 @@ def run(
     )
 
     result_collect = []
+    detection_results_all = []
 
     for dataloader_count, dataloaders in enumerate(list_of_dataloaders):
         LOGGER.info(
@@ -98,39 +106,104 @@ def run(
                 )
                 torch.cuda.empty_cache()
                 PatchCore.fit(dataloaders["training"])
-                outlier_stats = getattr(PatchCore, "training_outlier_stats", {})
-                contamination_ratio = outlier_stats.get("pseudo_ratio", 0.0) * 100
-                recovered_patches = outlier_stats.get("recovered_patches", 0)
-                if contamination_ratio > 0:
+                training_stats = getattr(PatchCore, "training_statistics", {})
+                bank_size = training_stats.get("memory_bank_size")
+                info_nce = training_stats.get("info_nce")
+                if bank_size is not None:
                     LOGGER.info(
-                        "训练提示: 约 %.2f%% 的训练图像被判定为伪异常, 这是漏检率和过杀率上升的主要原因。",
-                        contamination_ratio,
+                        "CMAM 记忆库构建完成: 样本数 %d, InfoNCE %.4f.",
+                        int(bank_size),
+                        float(info_nce or 0.0),
                     )
-                if recovered_patches > 0:
-                    LOGGER.info(
-                        "通过伪异常清洗机制已回收 %d 个近似正常补丁用于记忆库。",
-                        recovered_patches,
-                    )
-                pseudo_samples = outlier_stats.get("pseudo_metadata", [])
-                if pseudo_samples:
-                    sample_paths = [
-                        meta.get("image_path") or meta.get("image_name")
-                        for meta in pseudo_samples[:5]
-                    ]
-                    LOGGER.info(
-                        "伪异常样本示例: %s",
-                        ", ".join(filter(None, sample_paths)),
-                    )
+                dica_mmd = training_stats.get("dica_mmd")
+                if dica_mmd is not None:
+                    LOGGER.info("DICA 域对齐平均 MMD: %.4f.", float(dica_mmd))
 
             torch.cuda.empty_cache()
             aggregator = {
                 "scores": [],
                 "segmentations": [],
+                "faf_maps": [],
+                "dica_maps": [],
                 "image_names": None,
                 "image_paths": None,
             }
             labels_gt = None
             masks_gt = None
+
+            def _normalize_prediction_output(prediction):
+                """Normalize PatchCore.predict outputs across legacy variants."""
+
+                if isinstance(prediction, tuple):
+                    prediction = list(prediction)
+
+                length = len(prediction)
+
+                if length == 8:
+                    return tuple(prediction)
+
+                if length == 7:
+                    (
+                        scores,
+                        segmentations,
+                        labels_pred,
+                        masks_pred,
+                        image_names,
+                        image_paths,
+                        faf_maps,
+                    ) = prediction
+                    return (
+                        scores,
+                        segmentations,
+                        labels_pred,
+                        masks_pred,
+                        image_names,
+                        image_paths,
+                        faf_maps,
+                        None,
+                    )
+
+                if length == 6:
+                    (
+                        scores,
+                        segmentations,
+                        labels_pred,
+                        masks_pred,
+                        image_names,
+                        image_paths,
+                    ) = prediction
+                    return (
+                        scores,
+                        segmentations,
+                        labels_pred,
+                        masks_pred,
+                        image_names,
+                        image_paths,
+                        None,
+                        None,
+                    )
+
+                if length == 4:
+                    scores, segmentations, faf_maps, dica_maps = prediction
+                    batch_len = len(scores) if hasattr(scores, "__len__") else 0
+                    labels_pred = [None] * batch_len
+                    masks_pred = [None] * batch_len
+                    image_names = [None] * batch_len
+                    image_paths = [None] * batch_len
+                    return (
+                        scores,
+                        segmentations,
+                        labels_pred,
+                        masks_pred,
+                        image_names,
+                        image_paths,
+                        faf_maps,
+                        dica_maps,
+                    )
+
+                raise ValueError(
+                    "Unexpected PatchCore.predict output length: {}".format(length)
+                )
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
                 LOGGER.info(
@@ -138,6 +211,10 @@ def run(
                         i + 1, len(PatchCore_list)
                     )
                 )
+                prediction = PatchCore.predict(
+                    dataloaders["testing"]
+                )
+
                 (
                     scores,
                     segmentations,
@@ -145,11 +222,15 @@ def run(
                     masks_pred,
                     image_names,
                     image_paths,
-                ) = PatchCore.predict(
-                    dataloaders["testing"]
-                )
+                    faf_maps,
+                    dica_maps,
+                ) = _normalize_prediction_output(prediction)
                 aggregator["scores"].append(scores)
                 aggregator["segmentations"].append(segmentations)
+                if faf_maps is not None:
+                    aggregator["faf_maps"].append(faf_maps)
+                if dica_maps is not None:
+                    aggregator["dica_maps"].append(dica_maps)
                 if aggregator["image_names"] is None:
                     aggregator["image_names"] = image_names
                     aggregator["image_paths"] = image_paths
@@ -160,7 +241,8 @@ def run(
             scores = np.array(aggregator["scores"])
             min_scores = scores.min(axis=-1).reshape(-1, 1)
             max_scores = scores.max(axis=-1).reshape(-1, 1)
-            scores = (scores - min_scores) / (max_scores - min_scores)
+            denom = np.maximum(max_scores - min_scores, 1e-12)
+            scores = (scores - min_scores) / denom
             scores = np.mean(scores, axis=0)
 
             segmentations = np.array(aggregator["segmentations"])
@@ -174,68 +256,357 @@ def run(
                 .max(axis=-1)
                 .reshape(-1, 1, 1, 1)
             )
-            segmentations = (segmentations - min_scores) / (max_scores - min_scores)
+            denom = np.maximum(max_scores - min_scores, 1e-12)
+            segmentations = (segmentations - min_scores) / denom
             segmentations = np.mean(segmentations, axis=0)
+
+            faf_maps = None
+            if aggregator["faf_maps"]:
+                has_faf = any(
+                    any(faf_item is not None for faf_item in model_maps)
+                    for model_maps in aggregator["faf_maps"]
+                )
+                if has_faf:
+                    filled_maps = []
+                    for model_maps in aggregator["faf_maps"]:
+                        cleaned = [
+                            np.asarray(faf_item, dtype=np.float32)
+                            for faf_item in model_maps
+                            if faf_item is not None
+                        ]
+                        if cleaned:
+                            filled_maps.append(np.stack(cleaned))
+                    if filled_maps:
+                        faf_stack = np.stack(filled_maps)
+                        min_vals = (
+                            faf_stack.reshape(len(filled_maps), faf_stack.shape[1], -1)
+                            .min(axis=-1)
+                            .reshape(len(filled_maps), faf_stack.shape[1], 1, 1)
+                        )
+                        max_vals = (
+                            faf_stack.reshape(len(filled_maps), faf_stack.shape[1], -1)
+                            .max(axis=-1)
+                            .reshape(len(filled_maps), faf_stack.shape[1], 1, 1)
+                        )
+                        denom = np.maximum(max_vals - min_vals, 1e-6)
+                        faf_stack = (faf_stack - min_vals) / denom
+                        faf_maps = np.mean(faf_stack, axis=0)
+
+            dica_maps = None
+            if aggregator["dica_maps"]:
+                has_dica = any(
+                    any(dica_item is not None for dica_item in model_maps)
+                    for model_maps in aggregator["dica_maps"]
+                )
+                if has_dica:
+                    filled_dica = []
+                    for model_maps in aggregator["dica_maps"]:
+                        cleaned = [
+                            np.asarray(dica_item, dtype=np.float32)
+                            for dica_item in model_maps
+                            if dica_item is not None
+                        ]
+                        if cleaned:
+                            filled_dica.append(np.stack(cleaned))
+                    if filled_dica:
+                        dica_stack = np.stack(filled_dica)
+                        min_vals = (
+                            dica_stack.reshape(len(filled_dica), dica_stack.shape[1], -1)
+                            .min(axis=-1)
+                            .reshape(len(filled_dica), dica_stack.shape[1], 1, 1)
+                        )
+                        max_vals = (
+                            dica_stack.reshape(len(filled_dica), dica_stack.shape[1], -1)
+                            .max(axis=-1)
+                            .reshape(len(filled_dica), dica_stack.shape[1], 1, 1)
+                        )
+                        denom = np.maximum(max_vals - min_vals, 1e-6)
+                        dica_stack = (dica_stack - min_vals) / denom
+                        dica_maps = np.mean(dica_stack, axis=0)
+
+            dataset = dataloaders["testing"].dataset
+            tile_suffixes = getattr(dataset, "tile_suffixes", [])
+            tiles_per_image = getattr(dataset, "tiles_per_image", 1)
 
             image_names = np.array(aggregator.get("image_names") or [], dtype=object)
             image_paths = np.array(aggregator.get("image_paths") or [], dtype=object)
 
-            anomaly_labels = [
-                x[1] != "good" for x in dataloaders["testing"].dataset.data_to_iterate
-            ]
+            data_entries = dataset.data_to_iterate
+            mask_paths = [entry[3] for entry in data_entries]
+            masks_available = any(path is not None for path in mask_paths)
+
+            if (
+                tiles_per_image > 1
+                and len(segmentations) % tiles_per_image == 0
+                and (faf_maps is None or len(faf_maps) % tiles_per_image == 0)
+            ):
+                tile_segmentations = segmentations.reshape(
+                    -1, tiles_per_image, *segmentations.shape[1:]
+                )
+                tile_scores = scores.reshape(-1, tiles_per_image)
+                tile_faf_maps = None
+                if faf_maps is not None:
+                    tile_faf_maps = faf_maps.reshape(
+                        -1, tiles_per_image, *faf_maps.shape[1:]
+                    )
+                tile_dica_maps = None
+                if dica_maps is not None:
+                    tile_dica_maps = dica_maps.reshape(
+                        -1, tiles_per_image, *dica_maps.shape[1:]
+                    )
+
+                per_image_segmentations = []
+                per_image_scores = []
+                per_image_paths = []
+                per_image_names = []
+                per_image_faf = []
+                per_image_dica = []
+
+                for idx in range(tile_segmentations.shape[0]):
+                    tile_stack = tile_segmentations[idx]
+                    merged_map = np.concatenate(
+                        [np.asarray(tile) for tile in tile_stack], axis=-1
+                    )
+                    per_image_segmentations.append(merged_map)
+                    per_image_scores.append(float(np.max(tile_scores[idx])))
+                    if tile_faf_maps is not None:
+                        faf_stack = tile_faf_maps[idx]
+                        merged_faf = np.concatenate(
+                            [np.asarray(tile) for tile in faf_stack], axis=-1
+                        )
+                        per_image_faf.append(merged_faf)
+                    if tile_dica_maps is not None:
+                        dica_stack = tile_dica_maps[idx]
+                        merged_dica = np.concatenate(
+                            [np.asarray(tile) for tile in dica_stack], axis=-1
+                        )
+                        per_image_dica.append(merged_dica)
+
+                    if image_paths.size:
+                        per_image_paths.append(image_paths[idx * tiles_per_image])
+                    else:
+                        per_image_paths.append(data_entries[idx][2])
+
+                    if image_names.size:
+                        base_name = image_names[idx * tiles_per_image]
+                        if isinstance(base_name, str):
+                            for suffix in tile_suffixes:
+                                if base_name.endswith(suffix):
+                                    base_name = base_name[: -len(suffix)]
+                                    break
+                        per_image_names.append(base_name)
+                    else:
+                        per_image_names.append(None)
+
+                segmentations = np.array(per_image_segmentations)
+                scores = np.array(per_image_scores)
+                image_paths = np.array(per_image_paths, dtype=object)
+                image_names = np.array(per_image_names, dtype=object)
+                if per_image_faf:
+                    faf_maps = np.array(per_image_faf)
+                elif tile_faf_maps is not None:
+                    faf_maps = np.zeros_like(segmentations)
+                if per_image_dica:
+                    dica_maps = np.array(per_image_dica)
+                elif tile_dica_maps is not None:
+                    dica_maps = np.zeros_like(segmentations)
+            else:
+                if not image_paths.size:
+                    image_paths = np.array([entry[2] for entry in data_entries], dtype=object)
+                if not image_names.size:
+                    image_names = np.array([None] * len(image_paths), dtype=object)
+                if faf_maps is not None and faf_maps.shape[0] != len(image_paths):
+                    faf_maps = faf_maps[: len(image_paths)]
+                if dica_maps is not None and dica_maps.shape[0] != len(image_paths):
+                    dica_maps = dica_maps[: len(image_paths)]
+
+            anomaly_labels = [entry[1] != "good" for entry in data_entries]
+
+            splitter = getattr(dataset, "split_pil_image", None)
+            transform_img = getattr(dataset, "transform_img", None)
+            transform_mask_fn = getattr(dataset, "transform_mask", None)
+            channel_mean = np.array(
+                getattr(dataset, "transform_mean", (0.485, 0.456, 0.406)),
+                dtype=np.float32,
+            ).reshape(-1, 1, 1)
+            channel_std = np.array(
+                getattr(dataset, "transform_std", (0.229, 0.224, 0.225)),
+                dtype=np.float32,
+            ).reshape(-1, 1, 1)
+            imagesize_attr = getattr(dataset, "imagesize", None)
+            if isinstance(imagesize_attr, (list, tuple)) and len(imagesize_attr) == 3:
+                default_channels = int(imagesize_attr[0])
+                default_height = int(imagesize_attr[1])
+                default_width = int(imagesize_attr[2])
+            else:
+                default_channels = int(channel_mean.shape[0]) or 3
+                default_height = None
+                default_width = None
+
+            def _split_tiles(pil_image):
+                if splitter is None:
+                    return [pil_image]
+                try:
+                    tiles = splitter(pil_image)
+                except Exception:  # pragma: no cover - defensive path
+                    LOGGER.debug(
+                        "split_pil_image 失败，直接使用原图尺寸进行可视化。"
+                    )
+                    tiles = None
+                if isinstance(tiles, (list, tuple)) and len(tiles):
+                    return list(tiles)
+                return [pil_image]
+
+            def _to_numpy_image(tile):
+                if transform_img is not None:
+                    tile_tensor = transform_img(tile)
+                    if isinstance(tile_tensor, torch.Tensor):
+                        tile_array = tile_tensor.detach().cpu().numpy()
+                    else:
+                        tile_array = np.asarray(tile_tensor, dtype=np.float32)
+                    if (
+                        tile_array.ndim == 3
+                        and tile_array.shape[0] == channel_mean.shape[0]
+                    ):
+                        tile_array = tile_array * channel_std + channel_mean
+                else:
+                    tile_array = np.asarray(tile.convert("RGB"), dtype=np.float32)
+                    tile_array = tile_array.transpose(2, 0, 1) / 255.0
+                return np.asarray(tile_array, dtype=np.float32)
+
+            def image_transform_fn(image):
+                tiles = _split_tiles(image.convert("RGB"))
+                tile_arrays = []
+                for tile in tiles:
+                    try:
+                        tile_arrays.append(_to_numpy_image(tile))
+                    except Exception:  # pragma: no cover - defensive path
+                        fallback = (
+                            np.asarray(tile.convert("RGB"), dtype=np.float32).transpose(2, 0, 1)
+                            / 255.0
+                        )
+                        tile_arrays.append(fallback)
+                if not tile_arrays:
+                    height = default_height or image.height
+                    width = default_width or image.width
+                    return np.zeros((default_channels, height, width), dtype=np.float32)
+                stitched = tile_arrays[0]
+                for extra in tile_arrays[1:]:
+                    stitched = np.concatenate((stitched, extra), axis=-1)
+                return np.clip(stitched, 0.0, 1.0)
+
+            def mask_transform_fn(mask_image):
+                tiles = _split_tiles(mask_image)
+                mask_arrays = []
+                for tile in tiles:
+                    if transform_mask_fn is not None:
+                        mask_tensor = transform_mask_fn(tile)
+                        if isinstance(mask_tensor, torch.Tensor):
+                            mask_array = mask_tensor.detach().cpu().numpy()
+                        else:
+                            mask_array = np.asarray(mask_tensor, dtype=np.float32)
+                    else:
+                        mask_array = np.asarray(tile, dtype=np.float32)
+                        if mask_array.ndim == 2:
+                            mask_array = np.expand_dims(mask_array, 0)
+                        else:
+                            mask_array = mask_array.transpose(2, 0, 1)
+                        if mask_array.max() > 1.0:
+                            mask_array = mask_array / 255.0
+                    mask_arrays.append(mask_array.astype(np.float32))
+                if not mask_arrays:
+                    height = default_height or mask_image.height
+                    width = default_width or mask_image.width
+                    return np.zeros((1, height, width), dtype=np.float32)
+                stitched = mask_arrays[0]
+                for extra in mask_arrays[1:]:
+                    stitched = np.concatenate((stitched, extra), axis=-1)
+                return np.clip(stitched, 0.0, 1.0)
 
             # (Optional) Plot example images.
             if save_segmentation_images:
-                image_paths = [
-                    x[2] for x in dataloaders["testing"].dataset.data_to_iterate
-                ]
-                mask_paths = [
-                    x[3] for x in dataloaders["testing"].dataset.data_to_iterate
-                ]
-
-                def image_transform(image):
-                    in_std = np.array(
-                        dataloaders["testing"].dataset.transform_std
-                    ).reshape(-1, 1, 1)
-                    in_mean = np.array(
-                        dataloaders["testing"].dataset.transform_mean
-                    ).reshape(-1, 1, 1)
-                    image = dataloaders["testing"].dataset.transform_img(image)
-                    return np.clip(
-                        (image.numpy() * in_std + in_mean) * 255, 0, 255
-                    ).astype(np.uint8)
-
-                def mask_transform(mask):
-                    return dataloaders["testing"].dataset.transform_mask(mask).numpy()
-
                 image_save_path = os.path.join(
                     run_save_path, "segmentation_images", dataset_name
                 )
                 os.makedirs(image_save_path, exist_ok=True)
-                patchcore.utils.plot_segmentation_images(
-                    image_save_path,
-                    image_paths,
-                    segmentations,
-                    scores,
-                    mask_paths,
-                    image_transform=image_transform,
-                    mask_transform=mask_transform,
+                plot_kwargs = dict(
+                    savefolder=image_save_path,
+                    image_paths=image_paths.tolist(),
+                    segmentations=segmentations,
+                    anomaly_scores=scores,
+                    mask_paths=mask_paths if masks_available else None,
+                    image_transform=image_transform_fn,
+                    mask_transform=mask_transform_fn,
                 )
-            reshaped_scores = scores.reshape(-1, 2)
+                try:
+                    signature = inspect.signature(
+                        patchcore.utils.plot_segmentation_images
+                    )
+                except (TypeError, ValueError):
+                    signature = None
 
-            # 使用最大值或平均值聚合
-            scores = np.max(reshaped_scores, axis=1)  # 或 np.mean
+                if signature is None or "file_extension" in signature.parameters:
+                    plot_kwargs["file_extension"] = "png"
 
-            if image_paths.size:
-                image_paths = image_paths.reshape(-1, 2)
-                base_image_paths = [pair[0] for pair in image_paths.tolist()]
-            else:
-                base_image_paths = [None] * len(scores)
-            if image_names.size:
-                image_names = image_names.reshape(-1, 2)
-                base_image_names = [pair[0] for pair in image_names.tolist()]
-            else:
-                base_image_names = [None] * len(scores)
+                saved_paths = patchcore.utils.plot_segmentation_images(**plot_kwargs)
+                if saved_paths:
+                    LOGGER.info(
+                        "示例可视化结果已保存到: %s 等，共 %d 张。",
+                        saved_paths[0],
+                        len(saved_paths),
+                    )
+
+            if save_faf_visualizations and faf_maps is not None and len(faf_maps):
+                faf_save_path = os.path.join(
+                    run_save_path, "faf_visualizations", dataset_name
+                )
+                os.makedirs(faf_save_path, exist_ok=True)
+
+                faf_plot_kwargs = dict(
+                    savefolder=faf_save_path,
+                    image_paths=image_paths.tolist(),
+                    faf_maps=[np.asarray(faf_map) for faf_map in faf_maps],
+                    image_transform=image_transform_fn,
+                )
+                saved_faf = patchcore.utils.plot_faf_enhancement_images(**faf_plot_kwargs)
+                if saved_faf:
+                    LOGGER.info(
+                        "FAF 增强图已保存到: %s 等，共 %d 张。",
+                        saved_faf[0],
+                        len(saved_faf),
+                    )
+
+            if save_dica_visualizations and dica_maps is not None and len(dica_maps):
+                dica_save_path = os.path.join(
+                    run_save_path, "dica_visualizations", dataset_name
+                )
+                os.makedirs(dica_save_path, exist_ok=True)
+
+                dica_plot_kwargs = dict(
+                    savefolder=dica_save_path,
+                    image_paths=image_paths.tolist(),
+                    dica_maps=[np.asarray(dica_map) for dica_map in dica_maps],
+                    image_transform=image_transform_fn,
+                )
+                if faf_maps is not None and len(faf_maps) >= len(dica_maps):
+                    dica_plot_kwargs["faf_maps"] = [
+                        np.asarray(faf_map) if faf_map is not None else None
+                        for faf_map in faf_maps[: len(dica_maps)]
+                    ]
+                saved_dica = patchcore.utils.plot_dica_alignment_images(**dica_plot_kwargs)
+                if saved_dica:
+                    LOGGER.info(
+                        "FAF+DICA 对齐图已保存到: %s 等，共 %d 张。",
+                        saved_dica[0],
+                        len(saved_dica),
+                    )
+            elif save_dica_visualizations:
+                LOGGER.warning(
+                    "请求保存 DICA 可视化，但当前推理未生成对齐热力图，请检查 DICA 配置或日志诊断信息。"
+                )
+
+            base_image_paths = image_paths.tolist()
+            base_image_names = image_names.tolist()
 
             LOGGER.info("Computing evaluation metrics.")
             imagewise_metrics = patchcore.metrics.compute_imagewise_retrieval_metrics(
@@ -276,6 +647,21 @@ def run(
                 overkill_rate = float('nan')
 
             LOGGER.info("Best Threshold: {:.4f}".format(best_threshold))
+            # ===== 保存阈值（给 server 用）=====
+            threshold_save_path = os.path.join(run_save_path, "threshold.json")
+
+            with open(threshold_save_path, "w") as f:
+                json.dump(
+                    {
+                        "best_threshold": float(best_threshold),
+                        "method": "youden_j",
+                        "dataset": dataset_name,
+                    },
+                    f,
+                    indent=2
+                )
+
+            LOGGER.info("阈值已保存到: %s", threshold_save_path)
             LOGGER.info("Miss Rate (漏检率): {:.2%}".format(miss_rate))
             LOGGER.info("Overkill Rate (过杀率): {:.2%}".format(overkill_rate))
 
@@ -291,25 +677,17 @@ def run(
                 else:
                     predicted_records.append(f"index_{idx}")
 
-            # if predicted_records:
-            #     LOGGER.info(
-            #         "预测为异常的样本路径列表: %s",
-            #         " | ".join(predicted_records),
-            #     )
-            # else:
-            #     LOGGER.info("预测为异常的样本路径列表: 无")
-
-            contamination_ratio = 0.0
-            recovered_patches = 0
             if PatchCore_list:
-                outlier_stats = getattr(PatchCore_list[0], "training_outlier_stats", {})
-                contamination_ratio = outlier_stats.get("pseudo_ratio", 0.0) * 100
-                recovered_patches = outlier_stats.get("recovered_patches", 0)
-            # LOGGER.info(
-            #     "诊断: 当前训练集污染率约为 %.2f%%, 伪异常清洗后回收补丁数为 %d, 这是影响漏检率/过杀率的关键因素。",
-            #     contamination_ratio,
-            #     recovered_patches,
-            # )
+                training_stats = getattr(PatchCore_list[0], "training_statistics", {})
+                bank_size = training_stats.get("memory_bank_size")
+                info_nce = training_stats.get("info_nce")
+                dica_mmd = training_stats.get("dica_mmd")
+                LOGGER.info(
+                    "诊断: CMAM 记忆库=%s, InfoNCE=%.4f, DICA MMD=%.4f.",
+                    "N/A" if bank_size is None else int(bank_size),
+                    float(info_nce or 0.0),
+                    float(dica_mmd or 0.0) if dica_mmd is not None else 0.0,
+                )
 
             # Compute PRO score & PW Auroc for all images
             # pixel_scores = patchcore.metrics.compute_pixelwise_retrieval_metrics(
@@ -345,6 +723,23 @@ def run(
             for key, item in result_collect[-1].items():
                 if key != "dataset_name":
                     LOGGER.info("{0}: {1:3.3f}".format(key, item))
+            for idx, score in enumerate(scores):
+                image_path = base_image_paths[idx] if idx < len(base_image_paths) else None
+                image_name = base_image_names[idx] if idx < len(base_image_names) else None
+                anomaly_flag = bool(anomaly_labels[idx])
+                detection_results_all.append(
+                    {
+                        "dataset": dataset_name,
+                        "image_path": str(image_path) if image_path else "",
+                        "image_name": str(image_name) if image_name else "",
+                        "ground_truth_label": "anomaly" if anomaly_flag else "good",
+                        "ground_truth_binary": int(anomaly_flag),
+                        "predicted_label": "anomaly" if y_pred[idx] == 1 else "good",
+                        "predicted_binary": int(y_pred[idx]),
+                        "anomaly_score": float(score),
+                        "best_threshold": float(best_threshold),
+                    }
+                )
 
             # (Optional) Store PatchCore model for later re-use.
             # SAVE all patchcores only if mean_threshold is passed?
@@ -373,6 +768,11 @@ def run(
         column_names=result_metric_names,
         row_names=result_dataset_names,
     )
+    if detection_results_all:
+        excel_save_path = os.path.join(run_save_path, "detection_results.xlsx")
+        detection_df = pd.DataFrame(detection_results_all)
+        detection_df.to_excel(excel_save_path, index=False)
+        LOGGER.info("检测结果明细已保存到 Excel 文件: %s", excel_save_path)
 
 
 @main.command("patch_core")
@@ -394,68 +794,19 @@ def run(
 # NN on GPU.
 @click.option("--faiss_on_gpu", is_flag=True)
 @click.option("--faiss_num_workers", type=int, default=8)
-@click.option("--use_pseudo_negatives", is_flag=True, help="Enable pseudo-negative memory bank.")
+@click.option("--adapter_depth", type=int, default=2, show_default=True)
+@click.option("--contrast_temp", type=float, default=0.07, show_default=True)
 @click.option(
-    "--pseudo_negative_ratio",
-    type=float,
-    default=0.05,
-    show_default=True,
-    help="Fraction of training images to treat as pseudo anomalies.",
+    "--enable_faf",
+    is_flag=True,
+    help="Enable Fractal Attention Fusion for self-similarity aware patch mixing.",
 )
 @click.option(
-    "--pseudo_negative_min_count",
+    "--fractal_order",
     type=int,
-    default=1,
+    default=3,
     show_default=True,
-    help="Minimum number of pseudo anomalies to keep.",
-)
-@click.option(
-    "--pseudo_negative_max_count",
-    type=int,
-    default=None,
-    help="Optional cap on pseudo anomaly images.",
-)
-@click.option(
-    "--pseudo_negative_temperature",
-    type=float,
-    default=0.05,
-    show_default=True,
-    help="Temperature for converting pseudo-memory distances to scores.",
-)
-@click.option(
-    "--pseudo_negative_weight",
-    type=float,
-    default=1.0,
-    show_default=True,
-    help="Weight of the pseudo memory branch when combining scores.",
-)
-@click.option(
-    "--pseudo_negative_eps",
-    type=float,
-    default=1e-6,
-    show_default=True,
-    help="Stability term for Mahalanobis covariance inversion.",
-)
-@click.option(
-    "--normal_memory_weight",
-    type=float,
-    default=1.0,
-    show_default=True,
-    help="Weight of the normal memory branch.",
-)
-@click.option(
-    "--clean_patch_quantile",
-    type=float,
-    default=0.9,
-    show_default=True,
-    help="Quantile used to keep clean-looking patches from contaminated images.",
-)
-@click.option(
-    "--clean_patch_min_ratio",
-    type=float,
-    default=0.05,
-    show_default=True,
-    help="Minimum ratio of clean patches required to recycle a contaminated image.",
+    help="Number of fractal refinement levels used to build the attention bias.",
 )
 def patch_core(
     backbone_names,
@@ -471,16 +822,10 @@ def patch_core(
     patchsize_aggregate,
     faiss_on_gpu,
     faiss_num_workers,
-    use_pseudo_negatives,
-    pseudo_negative_ratio,
-    pseudo_negative_min_count,
-    pseudo_negative_max_count,
-    pseudo_negative_temperature,
-    pseudo_negative_weight,
-    pseudo_negative_eps,
-    normal_memory_weight,
-    clean_patch_quantile,
-    clean_patch_min_ratio,
+    adapter_depth,
+    contrast_temp,
+    enable_faf,
+    fractal_order
 ):
     backbone_names = list(backbone_names)
     if len(backbone_names) > 1:
@@ -508,6 +853,9 @@ def patch_core(
             nn_method = patchcore.common.FaissNN(faiss_on_gpu, faiss_num_workers)
 
             patchcore_instance = patchcore.patchcore.PatchCore(device)
+            fractal_config = None
+            if enable_faf:
+                fractal_config = {"fractal_order": fractal_order}
             patchcore_instance.load(
                 backbone=backbone,
                 layers_to_extract_from=layers_to_extract_from,
@@ -519,16 +867,9 @@ def patch_core(
                 featuresampler=sampler,
                 anomaly_scorer_num_nn=anomaly_scorer_num_nn,
                 nn_method=nn_method,
-                use_pseudo_negatives=use_pseudo_negatives,
-                pseudo_negative_ratio=pseudo_negative_ratio,
-                pseudo_negative_min_count=pseudo_negative_min_count,
-                pseudo_negative_max_count=pseudo_negative_max_count,
-                pseudo_negative_temperature=pseudo_negative_temperature,
-                pseudo_negative_weight=pseudo_negative_weight,
-                pseudo_negative_eps=pseudo_negative_eps,
-                normal_memory_weight=normal_memory_weight,
-                clean_patch_quantile=clean_patch_quantile,
-                clean_patch_min_ratio=clean_patch_min_ratio,
+                adapter_depth=adapter_depth,
+                contrast_temperature=contrast_temp,
+                fractal_config=fractal_config,
             )
             loaded_patchcores.append(patchcore_instance)
         return loaded_patchcores
@@ -538,15 +879,15 @@ def patch_core(
 
 @main.command("sampler")
 @click.argument("name", type=str)
-@click.option("--percentage", "-p", type=float, default=0.1, show_default=True)
-def sampler(name, percentage):
+@click.option("--coreset_ratio", "-c", type=float, default=0.1, show_default=True)
+def sampler(name, coreset_ratio):
     def get_sampler(device):
         if name == "identity":
             return patchcore.sampler.IdentitySampler()
         elif name == "greedy_coreset":
-            return patchcore.sampler.GreedyCoresetSampler(percentage, device)
+            return patchcore.sampler.GreedyCoresetSampler(coreset_ratio, device)
         elif name == "approx_greedy_coreset":
-            return patchcore.sampler.ApproximateGreedyCoresetSampler(percentage, device)
+            return patchcore.sampler.ApproximateGreedyCoresetSampler(coreset_ratio, device)
 
     return ("get_sampler", get_sampler)
 
